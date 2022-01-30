@@ -39,6 +39,9 @@
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "driver/sdmmc_host.h"
+#include "driver/uart.h"
+#include "driver/gpio.h"
+#include "esp_pm.h"
 
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -66,6 +69,25 @@ static EventGroupHandle_t wifi_event_group;
    but we only care about one event - are we connected
    to the AP with an IP? */
 const int CONNECTED_BIT = BIT0;
+
+#define HOST_UART_TXD (CONFIG_HOST_UART_TXD)
+#define HOST_UART_RXD (CONFIG_HOST_UART_RXD)
+#define ECHO_TEST_RTS (UART_PIN_NO_CHANGE)
+#define ECHO_TEST_CTS (UART_PIN_NO_CHANGE)
+
+#define HOST_UART_PORT_NUM      (CONFIG_HOST_UART_PORT_NUM)
+#define HOST_UART_BAUD_RATE     (CONFIG_HOST_UART_BAUD_RATE)
+#define HOST_UART_COM_TASK_STACK_SIZE    (CONFIG_HOST_TASK_STACK_SIZE)
+#define HOST_WAKE_UP_ASSERTED       (1)
+#define HOST_WAKE_UP_DEASSERTED     (0)
+
+
+#define UART_FROM_HOST_BUF_SIZE (256)
+#define UART_FROM_HOST_MAX_FRAME_SIZE   (128)
+#define MAGIC_NUM_HOST_WAKEUP_TIMEOUT   (5000)  //Platform Specific
+
+static char uart_rx_buffer[UART_FROM_HOST_BUF_SIZE];
+static esp_pm_lock_handle_t host_uart_pm_lock;
 
 
 /* CA Root certificate, device ("Thing") certificate and device
@@ -169,7 +191,7 @@ void aws_iot_task(void *param) {
     IoT_Client_Connect_Params connectParams = iotClientConnectParamsDefault;
 
     IoT_Publish_Message_Params paramsQOS0;
-    IoT_Publish_Message_Params paramsQOS1;
+    //IoT_Publish_Message_Params paramsQOS1;
 
     ESP_LOGI(TAG, "AWS IoT SDK Version %d.%d.%d-%s", VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH, VERSION_TAG);
 
@@ -264,9 +286,9 @@ void aws_iot_task(void *param) {
     paramsQOS0.payload = (void *) cPayload;
     paramsQOS0.isRetained = 0;
 
-    paramsQOS1.qos = QOS1;
-    paramsQOS1.payload = (void *) cPayload;
-    paramsQOS1.isRetained = 0;
+    //paramsQOS1.qos = QOS1;
+    //paramsQOS1.payload = (void *) cPayload;
+    //paramsQOS1.isRetained = 0;
 
     while((NETWORK_ATTEMPTING_RECONNECT == rc || NETWORK_RECONNECTED == rc || SUCCESS == rc)) {
 
@@ -278,18 +300,18 @@ void aws_iot_task(void *param) {
         }
 
         ESP_LOGI(TAG, "Stack remaining for task '%s' is %d bytes", pcTaskGetTaskName(NULL), uxTaskGetStackHighWaterMark(NULL));
-        vTaskDelay(1000 / portTICK_RATE_MS);
+        vTaskDelay(5000 / portTICK_RATE_MS);
         sprintf(cPayload, "%s : %d ", "hello from ESP32 (QOS0)", i++);
         paramsQOS0.payloadLen = strlen(cPayload);
         rc = aws_iot_mqtt_publish(&client, TOPIC, TOPIC_LEN, &paramsQOS0);
 
-        sprintf(cPayload, "%s : %d ", "hello from ESP32 (QOS1)", i++);
-        paramsQOS1.payloadLen = strlen(cPayload);
-        rc = aws_iot_mqtt_publish(&client, TOPIC, TOPIC_LEN, &paramsQOS1);
-        if (rc == MQTT_REQUEST_TIMEOUT_ERROR) {
-            ESP_LOGW(TAG, "QOS1 publish ack not received.");
-            rc = SUCCESS;
-        }
+        //sprintf(cPayload, "%s : %d ", "hello from ESP32 (QOS1)", i++);
+        //paramsQOS1.payloadLen = strlen(cPayload);
+        //rc = aws_iot_mqtt_publish(&client, TOPIC, TOPIC_LEN, &paramsQOS1);
+        //if (rc == MQTT_REQUEST_TIMEOUT_ERROR) {
+        //    ESP_LOGW(TAG, "QOS1 publish ack not received.");
+        //    rc = SUCCESS;
+        //}
     }
 
     ESP_LOGE(TAG, "An error occurred in the main loop.");
@@ -314,6 +336,7 @@ static void initialise_wifi(void)
     ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_STA) );
     ESP_ERROR_CHECK( esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
     ESP_ERROR_CHECK( esp_wifi_start() );
+    esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
 }
 
 
@@ -326,6 +349,18 @@ void app_main()
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK( err );
+    #if CONFIG_PM_ENABLE
+    esp_pm_config_esp32c3_t pm_config = {
+            .max_freq_mhz = CONFIG_EXAMPLE_MAX_CPU_FREQ_MHZ,
+            .min_freq_mhz = CONFIG_EXAMPLE_MIN_CPU_FREQ_MHZ,
+    #if CONFIG_FREERTOS_USE_TICKLESS_IDLE
+            .light_sleep_enable = true
+    #endif
+        };
+        
+        esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "host uart", &host_uart_pm_lock);
+        ESP_ERROR_CHECK( esp_pm_configure(&pm_config) );
+    #endif
 
     initialise_wifi();
     xTaskCreatePinnedToCore(&aws_iot_task, "aws_iot_task", 9216, NULL, 5, NULL, 1);
