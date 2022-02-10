@@ -69,6 +69,7 @@ static EventGroupHandle_t wifi_event_group;
    but we only care about one event - are we connected
    to the AP with an IP? */
 const int CONNECTED_BIT = BIT0;
+#define HOST_UPDATE_BIT              (0x02)
 
 #define HOST_UART_TXD (CONFIG_HOST_UART_TXD)
 #define HOST_UART_RXD (CONFIG_HOST_UART_RXD)
@@ -88,7 +89,8 @@ const int CONNECTED_BIT = BIT0;
 
 static char uart_rx_buffer[UART_FROM_HOST_BUF_SIZE];
 static esp_pm_lock_handle_t host_uart_pm_lock;
-
+TaskHandle_t aws_iot_task_handle = NULL;
+TaskHandle_t uart_comm_task_handle = NULL;
 
 /* CA Root certificate, device ("Thing") certificate and device
  * ("Thing") key.
@@ -151,11 +153,33 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
     }
     return ESP_OK;
 }
+char aws_payload_buf[15];
+
+char aws_sys_mode  = 0;
+char aws_setpoint = 0;
+
+char host_sys_mode;
+char host_setpoint;
 
 void iot_subscribe_callback_handler(AWS_IoT_Client *pClient, char *topicName, uint16_t topicNameLen,
                                     IoT_Publish_Message_Params *params, void *pData) {
     ESP_LOGI(TAG, "Subscribe callback");
     ESP_LOGI(TAG, "%.*s\t%.*s", topicNameLen, topicName, (int) params->payloadLen, (char *)params->payload);
+    memset(aws_payload_buf,0,sizeof(aws_payload_buf));
+    memcpy(aws_payload_buf,(char *)params->payload, (int)params->payloadLen);
+    if(aws_payload_buf[1] == 'H'){
+        aws_sys_mode = 2;
+        aws_setpoint = (aws_payload_buf[8] - '0')*10 + (aws_payload_buf[9] - '0');
+    }
+    else if(aws_payload_buf[1] == 'C'){
+        aws_sys_mode = 0;
+        aws_setpoint = (aws_payload_buf[8] - '0')*10 + (aws_payload_buf[9] - '0');
+
+    }
+    else if(aws_payload_buf[1] == 'O'){
+        aws_sys_mode = 1;
+    }
+    //printf("len %d, %s", (int)params->payloadLen, (char *)params->payload);
 }
 
 void disconnectCallbackHandler(AWS_IoT_Client *pClient, void *data) {
@@ -179,10 +203,13 @@ void disconnectCallbackHandler(AWS_IoT_Client *pClient, void *data) {
     }
 }
 
+static int number_of_timeout = 0;
+
 void aws_iot_task(void *param) {
-    char cPayload[100];
+    char cPayload[30];
 
     int32_t i = 0;
+    uint32_t ulNotifiedValue;
 
     IoT_Error_t rc = FAILURE;
 
@@ -299,11 +326,34 @@ void aws_iot_task(void *param) {
             continue;
         }
 
-        ESP_LOGI(TAG, "Stack remaining for task '%s' is %d bytes", pcTaskGetTaskName(NULL), uxTaskGetStackHighWaterMark(NULL));
-        vTaskDelay(5000 / portTICK_RATE_MS);
-        sprintf(cPayload, "%s : %d ", "hello from ESP32 (QOS0)", i++);
-        paramsQOS0.payloadLen = strlen(cPayload);
-        rc = aws_iot_mqtt_publish(&client, TOPIC, TOPIC_LEN, &paramsQOS0);
+        xTaskNotifyWait(0x00, 0xFFFFFFFF, &ulNotifiedValue, pdMS_TO_TICKS(1000) );
+        if(ulNotifiedValue & HOST_UPDATE_BIT){
+            if(host_sys_mode == 0){
+                sprintf(cPayload,"%s : %d ", "Cool To", host_setpoint);
+            }
+            else if(host_sys_mode == 1){
+                sprintf(cPayload,"%s ", "System Off");
+            }
+            else if(host_sys_mode == 2){
+                sprintf(cPayload,"%s : %d ", "Heat To", host_setpoint);
+            }
+            paramsQOS0.payloadLen = strlen(cPayload);
+            rc = aws_iot_mqtt_publish(&client, TOPIC, TOPIC_LEN, &paramsQOS0);
+        }
+        else{
+            number_of_timeout ++;
+            if(number_of_timeout > 30){
+                number_of_timeout = 0;
+                ESP_LOGI(TAG, "Stack remaining for task '%s' is %d bytes", pcTaskGetTaskName(NULL), uxTaskGetStackHighWaterMark(NULL));
+                //vTaskDelay(5000 / portTICK_RATE_MS);
+                sprintf(cPayload, "%s : %d ", "Heart Beat from ESP32 (QOS0)", i++);
+                paramsQOS0.payloadLen = strlen(cPayload);
+                rc = aws_iot_mqtt_publish(&client, TOPIC, TOPIC_LEN, &paramsQOS0);
+            }
+        }
+        
+        
+        
 
         //sprintf(cPayload, "%s : %d ", "hello from ESP32 (QOS1)", i++);
         //paramsQOS1.payloadLen = strlen(cPayload);
@@ -322,6 +372,7 @@ static void initialise_wifi(void)
 {
     tcpip_adapter_init();
     wifi_event_group = xEventGroupCreate();
+    
     ESP_ERROR_CHECK( esp_event_loop_init(event_handler, NULL) );
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK( esp_wifi_init(&cfg) );
@@ -339,6 +390,99 @@ static void initialise_wifi(void)
     esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
 }
 
+static void config_host_uart_handshakepins(void)
+{
+    gpio_config_t io_conf;
+    //disable interrupt
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pin_bit_mask = (1ULL << CONFIG_HOST_WAKE_PIN);
+    io_conf.pull_down_en = 1;
+    io_conf.pull_up_en = 0;
+    gpio_config(&io_conf);
+    gpio_set_level(CONFIG_HOST_WAKE_PIN, HOST_WAKE_UP_DEASSERTED);
+
+}
+char prev_aws_sysmode = 0;
+char prev_aws_setpoint = 0;
+static void uart_host_com_task(void *arg)
+{
+    /* Configure parameters of an UART driver,
+     * communication pins and install the driver */
+    uart_config_t uart_config = {
+        .baud_rate = HOST_UART_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_APB,
+    };
+    int intr_alloc_flags = 0;
+    bool isDataFromHostValid = false;
+    int rx_len = 0;
+
+#if CONFIG_UART_ISR_IN_IRAM
+    intr_alloc_flags = ESP_INTR_FLAG_IRAM;
+#endif
+    config_host_uart_handshakepins();
+    
+    ESP_ERROR_CHECK(uart_driver_install(HOST_UART_PORT_NUM, UART_FROM_HOST_BUF_SIZE * 2, 0, 0, NULL, intr_alloc_flags));
+    ESP_ERROR_CHECK(uart_param_config(HOST_UART_PORT_NUM, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(HOST_UART_PORT_NUM, HOST_UART_TXD, HOST_UART_RXD, ECHO_TEST_RTS, ECHO_TEST_CTS));
+    int recv_seq = 0;
+
+    while (1) {
+        //Flush the RX buffer
+        esp_pm_lock_acquire(host_uart_pm_lock);
+        uart_flush(HOST_UART_PORT_NUM);
+        isDataFromHostValid = false;
+        memset(uart_rx_buffer, 0, sizeof(uart_rx_buffer));
+        //Wake up SAML22
+        gpio_set_level(CONFIG_HOST_WAKE_PIN, HOST_WAKE_UP_ASSERTED);
+
+        //Now we wait for SAML22 to wake up and send data
+        //it's fully the delay cannot be set to 10-20ms, not sure why, otherwise it will fail in case of first comm after esp32 bootup.
+        rx_len = uart_read_bytes(HOST_UART_PORT_NUM, uart_rx_buffer, UART_FROM_HOST_MAX_FRAME_SIZE, 100 / portTICK_RATE_MS);
+        if(rx_len == UART_FROM_HOST_MAX_FRAME_SIZE){
+            //To Do
+            //Add Fletcher16 or CRC16
+            recv_seq = atoi(&uart_rx_buffer[4]);
+            isDataFromHostValid = true;
+            if((uart_rx_buffer[0] != 0xFF) || (uart_rx_buffer[1] != 0xFF)){
+                host_setpoint = uart_rx_buffer[1];
+                host_sys_mode = uart_rx_buffer[0];
+                xTaskNotify(aws_iot_task_handle, HOST_UPDATE_BIT, eSetBits );
+            }
+
+        }
+        else{
+            printf("recv %d\n",rx_len);
+        }
+        if(isDataFromHostValid == true){
+            if((aws_sys_mode != prev_aws_sysmode) || (aws_setpoint != prev_aws_setpoint)){
+                uart_rx_buffer[0] = aws_sys_mode;
+                uart_rx_buffer[1] = aws_setpoint;
+                prev_aws_sysmode = aws_sys_mode;
+                prev_aws_setpoint = aws_setpoint;
+            }
+            else{
+                uart_rx_buffer[0] = 0xFF;
+                uart_rx_buffer[1] = 0xFF;
+            }
+            uart_write_bytes(HOST_UART_PORT_NUM, (const char *) uart_rx_buffer, UART_FROM_HOST_MAX_FRAME_SIZE);
+            //printf("[APP]succ recv from saml22, seq %d\n",recv_seq);   
+            uart_wait_tx_done(HOST_UART_PORT_NUM,(TickType_t)portMAX_DELAY);
+        }
+        else{
+            //Something is wrong, we didn't get enough data     
+            printf("[APP]failed recv from saml22\n");       
+            uart_flush(HOST_UART_PORT_NUM);
+        }
+        esp_pm_lock_release(host_uart_pm_lock);
+        gpio_set_level(CONFIG_HOST_WAKE_PIN, HOST_WAKE_UP_DEASSERTED);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
 
 void app_main()
 {
@@ -363,5 +507,6 @@ void app_main()
     #endif
 
     initialise_wifi();
-    xTaskCreatePinnedToCore(&aws_iot_task, "aws_iot_task", 9216, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(&aws_iot_task, "aws_iot_task", 9216, NULL, 5, &aws_iot_task_handle, 1);
+    xTaskCreate(uart_host_com_task, "uart_host_com_task", HOST_UART_COM_TASK_STACK_SIZE, NULL, 10, &uart_comm_task_handle);
 }

@@ -7,3 +7,5 @@ examples/**/build
 
 # AWS IoT Examples require device-specific certs/keys
 examples/*/main/certs/*.pem.*
+
+build/
